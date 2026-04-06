@@ -41,12 +41,14 @@ typedef struct
   uint8_t gray_m;
   uint8_t gray_r1;
   uint8_t gray_r2;
+  uint8_t gray_pattern;
+  int8_t track_error;
   int16_t left_target;
   int16_t right_target;
-  int16_t left_speed;
-  int16_t right_speed;
-  int16_t left_duty;
-  int16_t right_duty;
+  int16_t left_output;
+  int16_t right_output;
+  int16_t enc_left_delta;
+  int16_t enc_right_delta;
 } DebugStatus_t;
 
 /* USER CODE END PTD */
@@ -55,22 +57,29 @@ typedef struct
 /* USER CODE BEGIN PD */
 #define DEBUG_MODE_NAME "TRACE"
 #define MOTOR_PWM_PERIOD 2599U
-#define TRACE_BASE_SPEED 15U
-#define TRACE_SEARCH_SPEED 25U
-#define TRACE_RIGHT_BIAS 80U
-
-/* 速度闭环：目标单位为 encoder counts/10ms（4倍频脉冲数）*/
-/* 先填 0，烧录后手推轮子看串口 left_speed/right_speed 再调 */
-#define SPD_BASE        80      /* 直行基础转速 counts/10ms */
-#define SPD_SEARCH      200     /* 搜索转速 counts/10ms     */
-#define SPD_BIAS        20      /* 右轮前进补偿             */
-
-/* 速度 PID 参数（增量式），先用 P 控制，I/D 置 0 再调 */
-#define PID_KP          8.0f
-#define PID_KI          0.5f
-#define PID_KD          1.0f
-#define PID_OUT_MAX     ((int16_t)MOTOR_PWM_PERIOD)
-#define PID_ITERM_MAX   600
+#define TRACE_BASE_SPEED 380U
+#define TRACE_SEARCH_SPEED 220U
+#define TRACE_RIGHT_BIAS 10U
+#define CTRL_PERIOD_MS 10U
+#define DEBUG_TX_DIV 10U
+#define VOFA_TX_DIV 5U
+#define OLED_TX_DIV 20U
+#define UART_TX_TIMEOUT_MS 20U
+#define POINT_NOTIFY_MS 120U
+#define STOP_ON_LINE_TIMEOUT_MS 3000U
+#define STOP_ON_LINE_STABLE_COUNT 8U
+#define STRAIGHT_HOLD_MS 450U
+#define STRAIGHT_HOLD_KP 2
+#define STRAIGHT_HOLD_KI 1
+#define STRAIGHT_HOLD_I_LIMIT 80
+#define STRAIGHT_HOLD_CORR_LIMIT 25
+#define ENCODER_LEFT_SIGN (-1)
+#define ENCODER_RIGHT_SIGN (1)
+#define ENC_MODEL_SHIFT 4U
+#define ENC_PI_KP 3
+#define ENC_PI_KI 1
+#define ENC_PI_I_LIMIT 400
+#define ENC_PI_COMP_LIMIT 300
 
 /* USER CODE END PD */
 
@@ -90,24 +99,16 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 uint32_t uart_heartbeat = 0;
-char uart_msg[160];
+char uart_msg[256];
 uint8_t oled_buffer[8][128];
 uint8_t oled_i2c_addr_write = 0x78;
 bool oled_online = false;
 DebugStatus_t g_debug_status = {0};
-
-typedef struct
-{
-  float kp;
-  float ki;
-  float kd;
-  float i_term;
-  int16_t last_error;
-  int16_t duty;
-} WheelPID_t;
-
-static WheelPID_t g_pid_left  = {PID_KP, PID_KI, PID_KD, 0, 0, 0};
-static WheelPID_t g_pid_right = {PID_KP, PID_KI, PID_KD, 0, 0, 0};
+int32_t motor_pi_i_left = 0;
+int32_t motor_pi_i_right = 0;
+int8_t motor_pi_sign_left = 0;
+int8_t motor_pi_sign_right = 0;
+int8_t motor_channel_state[3] = {0};
 
 /* USER CODE END PV */
 
@@ -129,9 +130,16 @@ static void MOTOR_SetChannelPair(uint32_t channel, int16_t duty);
 static void MOTOR_SetPM1(int16_t duty);
 static void MOTOR_SetPM2(int16_t duty);
 static void MOTOR_StopAll(void);
-static void CHASSIS_SetOpenLoop(int16_t left_target, int16_t right_target);
-static void CHASSIS_SetSpeed(int16_t left_spd, int16_t right_spd);
+static void chassis_stop(void);
+static void chassis_set_open_loop(int16_t left_target, int16_t right_target);
 static const char *MOTOR_GetModeName(uint8_t mode);
+static void line_follow_slow(uint8_t pattern, int8_t error);
+static void go_straight_open_loop(void);
+static void search_line_left(void);
+static void search_line_right(void);
+static void point_notify(void);
+static void stop_on_line(void);
+static void go_straight_with_hold(void);
 static uint8_t READ_GRAY_L2(void);
 static uint8_t READ_GRAY_L1(void);
 static uint8_t READ_GRAY_M(void);
@@ -139,7 +147,8 @@ static uint8_t READ_GRAY_R1(void);
 static uint8_t READ_GRAY_R2(void);
 static uint8_t GRAY_GetPattern(void);
 static int8_t GRAY_CalcError(uint8_t pattern, int8_t *last_error);
-static void CHASSIS_ApplyTrace(int8_t error, uint8_t pattern);
+static void line_follow_basic(uint8_t pattern, int8_t error);
+static int16_t ENCODER_ReadDeltaAndReset(TIM_HandleTypeDef *htim);
 
 /* USER CODE END PFP */
 
@@ -153,6 +162,8 @@ enum
 {
   MOTOR_MODE_STOP = 0,
   MOTOR_MODE_TRACE,
+  MOTOR_MODE_TRACE_SLOW,
+  MOTOR_MODE_STRAIGHT,
   MOTOR_MODE_SEARCH_LEFT,
   MOTOR_MODE_SEARCH_RIGHT,
   MOTOR_MODE_LOST_STRAIGHT
@@ -171,9 +182,56 @@ static const uint8_t oled_digit_segments[10] = {
   0x6F  /* 9 */
 };
 
+static int16_t CLAMP_I16(int32_t value, int16_t min_value, int16_t max_value)
+{
+  if (value < min_value)
+  {
+    return min_value;
+  }
+  if (value > max_value)
+  {
+    return max_value;
+  }
+  return (int16_t)value;
+}
+
+static int32_t CLAMP_I32(int32_t value, int32_t min_value, int32_t max_value)
+{
+  if (value < min_value)
+  {
+    return min_value;
+  }
+  if (value > max_value)
+  {
+    return max_value;
+  }
+  return value;
+}
+
+static int8_t SIGN_I16(int16_t value)
+{
+  if (value > 0)
+  {
+    return 1;
+  }
+  if (value < 0)
+  {
+    return -1;
+  }
+  return 0;
+}
+
 static void UART2_SendString(const char *str)
 {
-  HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), HAL_MAX_DELAY);
+  if (HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), UART_TX_TIMEOUT_MS) == HAL_OK)
+  {
+    g_debug_status.uart_online = 1U;
+  }
+  else
+  {
+    g_debug_status.uart_online = 0U;
+    g_debug_status.error_flag = 1U;
+  }
 }
 
 static const char *MOTOR_GetModeName(uint8_t mode)
@@ -181,6 +239,8 @@ static const char *MOTOR_GetModeName(uint8_t mode)
   switch (mode)
   {
     case MOTOR_MODE_TRACE: return "TRACE";
+    case MOTOR_MODE_TRACE_SLOW: return "TRACE_SLOW";
+    case MOTOR_MODE_STRAIGHT: return "STRAIGHT";
     case MOTOR_MODE_SEARCH_LEFT: return "SEARCH_L";
     case MOTOR_MODE_SEARCH_RIGHT: return "SEARCH_R";
     case MOTOR_MODE_LOST_STRAIGHT: return "LOST_STRAIGHT";
@@ -190,7 +250,18 @@ static const char *MOTOR_GetModeName(uint8_t mode)
 
 static void MOTOR_SetChannelPair(uint32_t channel, int16_t duty)
 {
+  uint8_t channel_idx = 0;
+  int8_t target_state = 0;
   uint16_t compare;
+
+  if (channel == TIM_CHANNEL_1)
+  {
+    channel_idx = 1U;
+  }
+  else if (channel == TIM_CHANNEL_2)
+  {
+    channel_idx = 2U;
+  }
 
   if (duty > (int16_t)MOTOR_PWM_PERIOD)
   {
@@ -201,27 +272,38 @@ static void MOTOR_SetChannelPair(uint32_t channel, int16_t duty)
     duty = -(int16_t)MOTOR_PWM_PERIOD;
   }
 
+  target_state = SIGN_I16(duty);
+
   if (duty == 0)
   {
-    HAL_TIM_PWM_Stop(&htim1, channel);
-    HAL_TIMEx_PWMN_Stop(&htim1, channel);
+    if (motor_channel_state[channel_idx] != 0)
+    {
+      HAL_TIM_PWM_Stop(&htim1, channel);
+      HAL_TIMEx_PWMN_Stop(&htim1, channel);
+      motor_channel_state[channel_idx] = 0;
+    }
     __HAL_TIM_SET_COMPARE(&htim1, channel, 0);
     return;
   }
 
   compare = (uint16_t)((duty > 0) ? duty : -duty);
-  __HAL_TIM_SET_COMPARE(&htim1, channel, compare);
 
-  if (duty > 0)
+  if (motor_channel_state[channel_idx] != target_state)
   {
-    HAL_TIMEx_PWMN_Stop(&htim1, channel);
-    HAL_TIM_PWM_Start(&htim1, channel);
+    if (target_state > 0)
+    {
+      HAL_TIMEx_PWMN_Stop(&htim1, channel);
+      HAL_TIM_PWM_Start(&htim1, channel);
+    }
+    else
+    {
+      HAL_TIM_PWM_Stop(&htim1, channel);
+      HAL_TIMEx_PWMN_Start(&htim1, channel);
+    }
+    motor_channel_state[channel_idx] = target_state;
   }
-  else
-  {
-    HAL_TIM_PWM_Stop(&htim1, channel);
-    HAL_TIMEx_PWMN_Start(&htim1, channel);
-  }
+
+  __HAL_TIM_SET_COMPARE(&htim1, channel, compare);
 }
 
 static void MOTOR_SetPM1(int16_t duty)
@@ -241,70 +323,134 @@ static void MOTOR_StopAll(void)
   MOTOR_SetPM2(0);
 }
 
-static void CHASSIS_SetOpenLoop(int16_t left_target, int16_t right_target)
+static void chassis_stop(void)
+{
+  g_debug_status.left_target = 0;
+  g_debug_status.right_target = 0;
+  MOTOR_StopAll();
+}
+
+static void chassis_set_open_loop(int16_t left_target, int16_t right_target)
 {
   g_debug_status.left_target = left_target;
   g_debug_status.right_target = right_target;
+  g_debug_status.left_output = left_target;
+  g_debug_status.right_output = right_target;
   MOTOR_SetPM1(left_target);
   MOTOR_SetPM2(right_target);
 }
 
-/* 单轮增量式 PID，target/actual 单位：counts/10ms（带符号）*/
-static int16_t WHEEL_PID_Calc(WheelPID_t *pid, int16_t target, int16_t actual)
+static void go_straight_open_loop(void)
 {
-  int16_t error = target - actual;
-  int16_t d_term = error - pid->last_error;
-
-  pid->i_term += pid->ki * (float)error;
-  if (pid->i_term >  (float)PID_ITERM_MAX) pid->i_term =  (float)PID_ITERM_MAX;
-  if (pid->i_term < -(float)PID_ITERM_MAX) pid->i_term = -(float)PID_ITERM_MAX;
-
-  pid->duty += (int16_t)(pid->kp * (float)error
-                       + pid->i_term
-                       + pid->kd * (float)d_term);
-
-  if (pid->duty >  PID_OUT_MAX) pid->duty =  PID_OUT_MAX;
-  if (pid->duty < -PID_OUT_MAX) pid->duty = -PID_OUT_MAX;
-
-  pid->last_error = error;
-  return pid->duty;
+  chassis_set_open_loop(
+      (int16_t)(TRACE_BASE_SPEED + TRACE_RIGHT_BIAS),
+      (int16_t)TRACE_BASE_SPEED);
 }
 
-/* 以目标转速（counts/10ms）控制底盘，内部调 PID 输出 duty */
-static void CHASSIS_SetSpeed(int16_t left_spd, int16_t right_spd)
+static void search_line_left(void)
 {
-  int16_t left_duty;
-  int16_t right_duty;
+  g_debug_status.motor_mode = MOTOR_MODE_SEARCH_LEFT;
+  chassis_set_open_loop(
+      0,
+      (int16_t)TRACE_SEARCH_SPEED);
+}
 
-  g_debug_status.left_target  = left_spd;
-  g_debug_status.right_target = right_spd;
+static void search_line_right(void)
+{
+  g_debug_status.motor_mode = MOTOR_MODE_SEARCH_RIGHT;
+  chassis_set_open_loop(
+      (int16_t)TRACE_SEARCH_SPEED,
+      0);
+}
 
-  /* 目标为 0 时直接停车并复位积分，避免积分饱和 */
-  if (left_spd == 0)
-  {
-    g_pid_left.i_term = 0;
-    g_pid_left.duty   = 0;
-    MOTOR_SetPM1(0);
+static void point_notify(void)
+{
+  HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
+  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+  HAL_GPIO_TogglePin(BEEP_GPIO_Port, BEEP_Pin);
+  HAL_Delay(POINT_NOTIFY_MS);
+  HAL_GPIO_TogglePin(BEEP_GPIO_Port, BEEP_Pin);
+  HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
+  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+}
+
+static void go_straight_with_hold(void)
+{
+  uint32_t start_tick;
+  int32_t hold_i = 0;
+  int16_t base_left;
+  int16_t base_right;
+
+  base_left = (int16_t)(TRACE_BASE_SPEED + TRACE_RIGHT_BIAS);
+  base_right = (int16_t)TRACE_BASE_SPEED;
+  g_debug_status.motor_mode = MOTOR_MODE_STRAIGHT;
+  start_tick = HAL_GetTick();
+
+  while ((HAL_GetTick() - start_tick) < STRAIGHT_HOLD_MS)
+    {
+      int16_t diff;
+      int16_t correction;
+
+      g_debug_status.enc_left_delta = (int16_t)(ENCODER_LEFT_SIGN * ENCODER_ReadDeltaAndReset(&htim3));
+      g_debug_status.enc_right_delta = (int16_t)(ENCODER_RIGHT_SIGN * ENCODER_ReadDeltaAndReset(&htim4));
+
+      diff = (int16_t)(g_debug_status.enc_left_delta - g_debug_status.enc_right_delta);
+    hold_i = CLAMP_I32(hold_i + diff, -(int32_t)STRAIGHT_HOLD_I_LIMIT, (int32_t)STRAIGHT_HOLD_I_LIMIT);
+    correction = CLAMP_I16(
+        (int32_t)(STRAIGHT_HOLD_KP * diff) + (int32_t)(STRAIGHT_HOLD_KI * hold_i),
+        -(int16_t)STRAIGHT_HOLD_CORR_LIMIT,
+        (int16_t)STRAIGHT_HOLD_CORR_LIMIT);
+
+    chassis_set_open_loop(
+        (int16_t)(base_left - correction),
+        (int16_t)(base_right + correction));
+    HAL_Delay(CTRL_PERIOD_MS);
   }
-  else
+}
+
+static void stop_on_line(void)
+{
+  uint16_t stable_count = 0;
+  int8_t local_last_error = g_debug_status.track_error;
+  uint32_t start_tick = HAL_GetTick();
+
+  while ((HAL_GetTick() - start_tick) < STOP_ON_LINE_TIMEOUT_MS)
   {
-    left_duty = WHEEL_PID_Calc(&g_pid_left, left_spd, g_debug_status.left_speed);
-    g_debug_status.left_duty = left_duty;
-    MOTOR_SetPM1(left_duty);
+    uint8_t pattern;
+
+    g_debug_status.enc_left_delta = (int16_t)(ENCODER_LEFT_SIGN * ENCODER_ReadDeltaAndReset(&htim3));
+    g_debug_status.enc_right_delta = (int16_t)(ENCODER_RIGHT_SIGN * ENCODER_ReadDeltaAndReset(&htim4));
+    g_debug_status.gray_l2 = READ_GRAY_L2();
+    g_debug_status.gray_l1 = READ_GRAY_L1();
+    g_debug_status.gray_m = READ_GRAY_M();
+    g_debug_status.gray_r1 = READ_GRAY_R1();
+    g_debug_status.gray_r2 = READ_GRAY_R2();
+    pattern = GRAY_GetPattern();
+    g_debug_status.gray_pattern = pattern;
+    g_debug_status.track_error = GRAY_CalcError(pattern, &local_last_error);
+
+    line_follow_slow(pattern, g_debug_status.track_error);
+
+    if ((pattern & 0x04U) != 0U)
+    {
+      stable_count++;
+    }
+    else
+    {
+      stable_count = 0;
+    }
+
+    if (stable_count >= STOP_ON_LINE_STABLE_COUNT)
+    {
+      break;
+    }
+
+    HAL_Delay(CTRL_PERIOD_MS);
   }
 
-  if (right_spd == 0)
-  {
-    g_pid_right.i_term = 0;
-    g_pid_right.duty   = 0;
-    MOTOR_SetPM2(0);
-  }
-  else
-  {
-    right_duty = WHEEL_PID_Calc(&g_pid_right, right_spd, g_debug_status.right_speed);
-    g_debug_status.right_duty = right_duty;
-    MOTOR_SetPM2(right_duty);
-  }
+  g_debug_status.motor_mode = MOTOR_MODE_STOP;
+  chassis_stop();
+  point_notify();
 }
 
 static uint8_t READ_GRAY_L2(void)
@@ -390,10 +536,10 @@ static int8_t GRAY_CalcError(uint8_t pattern, int8_t *last_error)
   return *last_error;
 }
 
-static void CHASSIS_ApplyTrace(int8_t error, uint8_t pattern)
+static void line_follow_basic(uint8_t pattern, int8_t error)
 {
-  int16_t left_spd  = (int16_t)(SPD_BASE + SPD_BIAS);
-  int16_t right_spd = (int16_t)SPD_BASE;
+  int16_t left_spd  = (int16_t)(TRACE_BASE_SPEED + TRACE_RIGHT_BIAS);
+  int16_t right_spd = (int16_t)TRACE_BASE_SPEED;
   int16_t correction = 0;
   uint8_t inner_pattern = (uint8_t)(pattern & 0x0EU);
   uint8_t edge_left  = (uint8_t)(pattern & 0x10U);
@@ -402,21 +548,19 @@ static void CHASSIS_ApplyTrace(int8_t error, uint8_t pattern)
   /* 优先处理边缘兜底：L2 / R2 看到线时，不做正常修正 */
   if ((edge_left != 0U) && (inner_pattern == 0U))
   {
-    g_debug_status.motor_mode = MOTOR_MODE_SEARCH_LEFT;
-    left_spd  = 0;
-    right_spd = (int16_t)SPD_SEARCH;
+    search_line_left();
+    return;
   }
   else if ((edge_right != 0U) && (inner_pattern == 0U))
   {
-    g_debug_status.motor_mode = MOTOR_MODE_SEARCH_RIGHT;
-    left_spd  = (int16_t)SPD_SEARCH;
-    right_spd = 0;
+    search_line_right();
+    return;
   }
   else if (inner_pattern == 0U)
   {
     g_debug_status.motor_mode = MOTOR_MODE_LOST_STRAIGHT;
-    left_spd  = (int16_t)SPD_SEARCH;
-    right_spd = (int16_t)SPD_SEARCH;
+    go_straight_open_loop();
+    return;
   }
   else
   {
@@ -460,7 +604,81 @@ static void CHASSIS_ApplyTrace(int8_t error, uint8_t pattern)
     right_spd += correction;
   }
 
-  CHASSIS_SetSpeed(left_spd, right_spd);
+  chassis_set_open_loop(left_spd, right_spd);
+}
+
+static void line_follow_slow(uint8_t pattern, int8_t error)
+{
+  int16_t left_spd  = (int16_t)(TRACE_BASE_SPEED / 2U + TRACE_RIGHT_BIAS / 2U);
+  int16_t right_spd = (int16_t)(TRACE_BASE_SPEED / 2U);
+  int16_t correction = 0;
+  uint8_t inner_pattern = (uint8_t)(pattern & 0x0EU);
+  uint8_t edge_left  = (uint8_t)(pattern & 0x10U);
+  uint8_t edge_right = (uint8_t)(pattern & 0x01U);
+
+  if ((edge_left != 0U) && (inner_pattern == 0U))
+  {
+    search_line_left();
+    return;
+  }
+  else if ((edge_right != 0U) && (inner_pattern == 0U))
+  {
+    search_line_right();
+    return;
+  }
+  else if (inner_pattern == 0U)
+  {
+    g_debug_status.motor_mode = MOTOR_MODE_LOST_STRAIGHT;
+    chassis_set_open_loop(
+        (int16_t)(TRACE_SEARCH_SPEED / 2U),
+        (int16_t)(TRACE_SEARCH_SPEED / 2U));
+    return;
+  }
+
+  g_debug_status.motor_mode = MOTOR_MODE_TRACE_SLOW;
+
+  if (inner_pattern == 0x04U)
+  {
+    correction = 0;
+  }
+  else if (error <= -3)
+  {
+    correction = 8;
+  }
+  else if (error == -2)
+  {
+    correction = 5;
+  }
+  else if (error == -1)
+  {
+    correction = 2;
+  }
+  else if (error >= 3)
+  {
+    correction = -8;
+  }
+  else if (error == 2)
+  {
+    correction = -5;
+  }
+  else if (error == 1)
+  {
+    correction = -2;
+  }
+
+  left_spd  -= correction;
+  right_spd += correction;
+  chassis_set_open_loop(left_spd, right_spd);
+}
+
+static int16_t ENCODER_ReadDeltaAndReset(TIM_HandleTypeDef *htim)
+{
+  int16_t delta;
+
+  delta = (int16_t)__HAL_TIM_GET_COUNTER(htim);
+  __HAL_TIM_SET_COUNTER(htim, 0);
+
+  return delta;
 }
 
 static void OLED_I2C_Delay(void)
@@ -724,8 +942,10 @@ static void OLED_DrawStatus(const DebugStatus_t *status)
   }
   else
   {
-    shown_left = (uint16_t)((status->left_target >= 0) ? status->left_target : -status->left_target);
-    shown_right = (uint16_t)((status->right_target >= 0) ? status->right_target : -status->right_target);
+    int16_t abs_left = (status->left_target >= 0) ? status->left_target : -status->left_target;
+    int16_t abs_right = (status->right_target >= 0) ? status->right_target : -status->right_target;
+    shown_left = (uint16_t)abs_left;
+    shown_right = (uint16_t)abs_right;
     shown_left /= 10U;
     shown_right /= 10U;
     shown_left %= 100U;
@@ -807,12 +1027,16 @@ static void DEBUG_SendStatusFrame(const DebugStatus_t *status)
   snprintf(
       uart_msg,
       sizeof(uart_msg),
-      "OPEN|mode=%s|hb=%lu|step=%s|left=%d|right=%d|l2=%u|l1=%u|m=%u|r1=%u|r2=%u|uart=%u|oled=%u|err=%u\r\n",
+      "OPEN|mode=%s|hb=%lu|step=%s|left=%d|right=%d|outL=%d|outR=%d|encL=%d|encR=%d|l2=%u|l1=%u|m=%u|r1=%u|r2=%u|uart=%u|oled=%u|err=%u\r\n",
       DEBUG_MODE_NAME,
       status->heartbeat,
       MOTOR_GetModeName(status->motor_mode),
       status->left_target,
       status->right_target,
+      status->left_output,
+      status->right_output,
+      status->enc_left_delta,
+      status->enc_right_delta,
       status->gray_l2,
       status->gray_l1,
       status->gray_m,
@@ -829,9 +1053,13 @@ static void VOFA_SendFireWaterFrame(const DebugStatus_t *status)
   snprintf(
       uart_msg,
       sizeof(uart_msg),
-      "obs:%d,%d,%u,%u,%u,%u,%u\n",
+      "obs:%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u\n",
       status->left_target,
       status->right_target,
+      status->left_output,
+      status->right_output,
+      status->enc_left_delta,
+      status->enc_right_delta,
       status->gray_l2,
       status->gray_l1,
       status->gray_m,
@@ -923,11 +1151,9 @@ int main(void)
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_USART2_UART_Init();
-  /* USER CODE BEGIN 2 */
   HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
-  __HAL_TIM_SET_COUNTER(&htim3, 0);
-  __HAL_TIM_SET_COUNTER(&htim4, 0);
+  /* USER CODE BEGIN 2 */
   g_debug_status.heartbeat = 0;
   g_debug_status.error_flag = 0;
   g_debug_status.uart_online = 1;
@@ -937,8 +1163,14 @@ int main(void)
   g_debug_status.gray_m = 0;
   g_debug_status.gray_r1 = 0;
   g_debug_status.gray_r2 = 0;
+  g_debug_status.gray_pattern = 0;
+  g_debug_status.track_error = 0;
   g_debug_status.left_target = 0;
   g_debug_status.right_target = 0;
+  g_debug_status.left_output = 0;
+  g_debug_status.right_output = 0;
+  g_debug_status.enc_left_delta = 0;
+  g_debug_status.enc_right_delta = 0;
 
   UART2_SendString("System boot OK\r\n");
   UART2_SendString("USART2 ready, baud=115200\r\n");
@@ -972,41 +1204,52 @@ int main(void)
   while (1)
   {
     static int8_t last_error = 0;
-    static int32_t last_enc_left  = 0;
-    static int32_t last_enc_right = 0;
-    int32_t cur_enc_left;
-    int32_t cur_enc_right;
+    static uint8_t debug_tx_div = 0;
+    static uint8_t vofa_tx_div = 0;
+    static uint8_t oled_tx_div = 0;
     uint8_t gray_pattern;
+    int8_t track_error;
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* 读取编码器，计算当前转速（counts/10ms，带符号）*/
-    cur_enc_left  = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
-    cur_enc_right = (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
-    g_debug_status.left_speed  = (int16_t)(cur_enc_left  - last_enc_left);
-    g_debug_status.right_speed = (int16_t)(cur_enc_right - last_enc_right);
-    last_enc_left  = cur_enc_left;
-    last_enc_right = cur_enc_right;
-
     g_debug_status.heartbeat = uart_heartbeat++;
-    g_debug_status.gray_l2 = READ_GRAY_L2();
-    g_debug_status.gray_l1 = READ_GRAY_L1();
-    g_debug_status.gray_m = READ_GRAY_M();
-    g_debug_status.gray_r1 = READ_GRAY_R1();
-    g_debug_status.gray_r2 = READ_GRAY_R2();
-    gray_pattern = GRAY_GetPattern();
-    CHASSIS_ApplyTrace(
-        GRAY_CalcError(gray_pattern, &last_error),
-        gray_pattern);
+  g_debug_status.heartbeat = uart_heartbeat++;
+  g_debug_status.enc_left_delta = (int16_t)(ENCODER_LEFT_SIGN * ENCODER_ReadDeltaAndReset(&htim3));
+  g_debug_status.enc_right_delta = (int16_t)(ENCODER_RIGHT_SIGN * ENCODER_ReadDeltaAndReset(&htim4));
+  g_debug_status.gray_l2 = READ_GRAY_L2();
+  g_debug_status.gray_l1 = READ_GRAY_L1();
+  g_debug_status.gray_m = READ_GRAY_M();
+  g_debug_status.gray_r1 = READ_GRAY_R1();
+  g_debug_status.gray_r2 = READ_GRAY_R2();
+  gray_pattern = GRAY_GetPattern();
+  g_debug_status.gray_pattern = gray_pattern;
+  track_error = GRAY_CalcError(gray_pattern, &last_error);
+  g_debug_status.track_error = track_error;
+  line_follow_basic(
+      gray_pattern,
+      track_error);
 
-    DEBUG_SendStatusFrame(&g_debug_status);
-    VOFA_SendFireWaterFrame(&g_debug_status);
-    if (uart_heartbeat % 5U == 0U)
+    debug_tx_div++;
+    vofa_tx_div++;
+    oled_tx_div++;
+
+    if (debug_tx_div >= DEBUG_TX_DIV)
     {
+      debug_tx_div = 0;
+      DEBUG_SendStatusFrame(&g_debug_status);
+    }
+    if (vofa_tx_div >= VOFA_TX_DIV)
+    {
+      vofa_tx_div = 0;
+      VOFA_SendFireWaterFrame(&g_debug_status);
+    }
+    if (oled_tx_div >= OLED_TX_DIV)
+    {
+      oled_tx_div = 0;
       OLED_DrawStatus(&g_debug_status);
     }
-    HAL_Delay(10);
+    HAL_Delay(CTRL_PERIOD_MS);
   }
   /* USER CODE END 3 */
 }

@@ -1,0 +1,25 @@
+--cpu Cortex-M3
+"xunxiandaima\startup_stm32f103xb.o"
+"xunxiandaima\main.o"
+"xunxiandaima\stm32f1xx_it.o"
+"xunxiandaima\stm32f1xx_hal_msp.o"
+"xunxiandaima\stm32f1xx_hal_gpio_ex.o"
+"xunxiandaima\stm32f1xx_hal_i2c.o"
+"xunxiandaima\stm32f1xx_hal.o"
+"xunxiandaima\stm32f1xx_hal_rcc.o"
+"xunxiandaima\stm32f1xx_hal_rcc_ex.o"
+"xunxiandaima\stm32f1xx_hal_gpio.o"
+"xunxiandaima\stm32f1xx_hal_dma.o"
+"xunxiandaima\stm32f1xx_hal_cortex.o"
+"xunxiandaima\stm32f1xx_hal_pwr.o"
+"xunxiandaima\stm32f1xx_hal_flash.o"
+"xunxiandaima\stm32f1xx_hal_flash_ex.o"
+"xunxiandaima\stm32f1xx_hal_exti.o"
+"xunxiandaima\stm32f1xx_hal_tim.o"
+"xunxiandaima\stm32f1xx_hal_tim_ex.o"
+"xunxiandaima\stm32f1xx_hal_uart.o"
+"xunxiandaima\system_stm32f1xx.o"
+--strict --scatter "XUNXIANDAIMA\XUNXIANDAIMA.sct"
+--summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
+--info sizes --info totals --info unused --info veneers
+--list "XUNXIANDAIMA.map" -o XUNXIANDAIMA\XUNXIANDAIMA.axf

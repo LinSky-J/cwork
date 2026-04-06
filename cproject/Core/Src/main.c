@@ -35,13 +35,14 @@ typedef struct
   uint8_t error_flag;
   uint8_t uart_online;
   uint8_t oled_online_flag;
+  int16_t encoder_pm1;
 } DebugStatus_t;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define DEBUG_MODE_NAME "OBS"
+#define DEBUG_MODE_NAME "ENC1"
 
 /* USER CODE END PD */
 
@@ -82,6 +83,8 @@ static void OLED_Init(void);
 static void OLED_DrawStatus(const DebugStatus_t *status);
 static void DEBUG_SendBootFrame(void);
 static void DEBUG_SendStatusFrame(const DebugStatus_t *status);
+static void VOFA_SendFireWaterFrame(const DebugStatus_t *status);
+static int16_t ENCODER_GetPM1Count(void);
 
 /* USER CODE END PFP */
 
@@ -107,6 +110,11 @@ static const uint8_t oled_digit_segments[10] = {
 static void UART2_SendString(const char *str)
 {
   HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), HAL_MAX_DELAY);
+}
+
+static int16_t ENCODER_GetPM1Count(void)
+{
+  return (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
 }
 
 static void OLED_I2C_Delay(void)
@@ -335,13 +343,16 @@ static void OLED_DrawStatus(const DebugStatus_t *status)
   uint8_t d2;
   uint8_t d3;
   uint8_t progress_width;
+  int16_t enc_value;
 
   if (!oled_online)
   {
     return;
   }
 
-  shown = (uint16_t)(status->heartbeat % 10000U);
+  enc_value = status->encoder_pm1;
+  shown = (uint16_t)((enc_value >= 0) ? enc_value : -enc_value);
+  shown %= 10000U;
   d0 = (uint8_t)((shown / 1000U) % 10U);
   d1 = (uint8_t)((shown / 100U) % 10U);
   d2 = (uint8_t)((shown / 10U) % 10U);
@@ -357,6 +368,12 @@ static void OLED_DrawStatus(const DebugStatus_t *status)
   OLED_DrawDigit7Seg(32, 14, d1);
   OLED_DrawDigit7Seg(60, 14, d2);
   OLED_DrawDigit7Seg(88, 14, d3);
+
+  /* 编码器为负时，在左侧画一个减号 */
+  if (enc_value < 0)
+  {
+    OLED_FillRect(0, 30, 8, 2, true);
+  }
 
   /* 右下角心跳点 */
   if ((status->heartbeat & 0x01U) != 0U)
@@ -388,8 +405,9 @@ static void DEBUG_SendBootFrame(void)
   snprintf(
       uart_msg,
       sizeof(uart_msg),
-      "BOOT|mode=%s|uart=%u|oled=%u|addr=0x%02X|err=%u\r\n",
+      "BOOT|mode=%s|enc1=%d|uart=%u|oled=%u|addr=0x%02X|err=%u\r\n",
       DEBUG_MODE_NAME,
+      g_debug_status.encoder_pm1,
       g_debug_status.uart_online,
       g_debug_status.oled_online_flag,
       (unsigned int)(oled_i2c_addr_write >> 1),
@@ -402,9 +420,24 @@ static void DEBUG_SendStatusFrame(const DebugStatus_t *status)
   snprintf(
       uart_msg,
       sizeof(uart_msg),
-      "STAT|mode=%s|hb=%lu|uart=%u|oled=%u|err=%u\r\n",
+      "STAT|mode=%s|hb=%lu|enc1=%d|uart=%u|oled=%u|err=%u\r\n",
       DEBUG_MODE_NAME,
       status->heartbeat,
+      status->encoder_pm1,
+      status->uart_online,
+      status->oled_online_flag,
+      status->error_flag);
+  UART2_SendString(uart_msg);
+}
+
+static void VOFA_SendFireWaterFrame(const DebugStatus_t *status)
+{
+  snprintf(
+      uart_msg,
+      sizeof(uart_msg),
+      "obs:%lu,%d,%u,%u,%u\n",
+      status->heartbeat,
+      status->encoder_pm1,
       status->uart_online,
       status->oled_online_flag,
       status->error_flag);
@@ -498,6 +531,7 @@ int main(void)
   g_debug_status.heartbeat = 0;
   g_debug_status.error_flag = 0;
   g_debug_status.uart_online = 1;
+  g_debug_status.encoder_pm1 = 0;
 
   UART2_SendString("System boot OK\r\n");
   UART2_SendString("USART2 ready, baud=115200\r\n");
@@ -514,8 +548,11 @@ int main(void)
     UART2_SendString("OLED not found (0x3C/0x3D)\r\n");
   }
 
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+  __HAL_TIM_SET_COUNTER(&htim3, 0);
   OLED_DrawStatus(&g_debug_status);
   DEBUG_SendBootFrame();
+  VOFA_SendFireWaterFrame(&g_debug_status);
 
   /* USER CODE END 2 */
 
@@ -527,7 +564,9 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     g_debug_status.heartbeat = uart_heartbeat;
+    g_debug_status.encoder_pm1 = ENCODER_GetPM1Count();
     DEBUG_SendStatusFrame(&g_debug_status);
+    VOFA_SendFireWaterFrame(&g_debug_status);
     OLED_DrawStatus(&g_debug_status);
     uart_heartbeat++;
     HAL_Delay(1000);
@@ -644,7 +683,7 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -654,18 +693,18 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -699,8 +738,8 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 0 */
 
+  TIM_Encoder_InitTypeDef sConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
 
   /* USER CODE BEGIN TIM3_Init 1 */
 
@@ -711,7 +750,16 @@ static void MX_TIM3_Init(void)
   htim3.Init.Period = 65535;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -721,22 +769,9 @@ static void MX_TIM3_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE BEGIN TIM3_Init 2 */
 
   /* USER CODE END TIM3_Init 2 */
-  HAL_TIM_MspPostInit(&htim3);
 
 }
 

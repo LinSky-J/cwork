@@ -87,10 +87,6 @@ void Error_Handler(void);
 #define MPU_SDA_GPIO_Port GPIOB
 #define L1_Pin GPIO_PIN_12
 #define L1_GPIO_Port GPIOB
-#define TIM1_CH1NA_Pin GPIO_PIN_13
-#define TIM1_CH1NA_GPIO_Port GPIOB
-#define TIM1_CH1NB_Pin GPIO_PIN_14
-#define TIM1_CH1NB_GPIO_Port GPIOB
 #define L2_Pin GPIO_PIN_15
 #define L2_GPIO_Port GPIOB
 #define PM1_AIN1_Pin GPIO_PIN_8

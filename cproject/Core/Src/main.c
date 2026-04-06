@@ -35,24 +35,42 @@ typedef struct
   uint8_t error_flag;
   uint8_t uart_online;
   uint8_t oled_online_flag;
-  uint8_t motor_enable;
+  uint8_t motor_mode;
   uint8_t gray_l2;
   uint8_t gray_l1;
   uint8_t gray_m;
   uint8_t gray_r1;
   uint8_t gray_r2;
-  int16_t enc1;
-  int16_t enc2;
+  int16_t left_target;
+  int16_t right_target;
+  int16_t left_speed;
+  int16_t right_speed;
+  int16_t left_duty;
+  int16_t right_duty;
 } DebugStatus_t;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define DEBUG_MODE_NAME "COMBO"
+#define DEBUG_MODE_NAME "TRACE"
 #define MOTOR_PWM_PERIOD 2599U
-#define MOTOR_TEST_DUTY  700U
-#define MOTOR_RUN_WINDOW_TICKS 15U
+#define TRACE_BASE_SPEED 15U
+#define TRACE_SEARCH_SPEED 25U
+#define TRACE_RIGHT_BIAS 80U
+
+/* 速度闭环：目标单位为 encoder counts/10ms（4倍频脉冲数）*/
+/* 先填 0，烧录后手推轮子看串口 left_speed/right_speed 再调 */
+#define SPD_BASE        80      /* 直行基础转速 counts/10ms */
+#define SPD_SEARCH      200     /* 搜索转速 counts/10ms     */
+#define SPD_BIAS        20      /* 右轮前进补偿             */
+
+/* 速度 PID 参数（增量式），先用 P 控制，I/D 置 0 再调 */
+#define PID_KP          8.0f
+#define PID_KI          0.5f
+#define PID_KD          1.0f
+#define PID_OUT_MAX     ((int16_t)MOTOR_PWM_PERIOD)
+#define PID_ITERM_MAX   600
 
 /* USER CODE END PD */
 
@@ -72,11 +90,24 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 uint32_t uart_heartbeat = 0;
-char uart_msg[64];
+char uart_msg[160];
 uint8_t oled_buffer[8][128];
 uint8_t oled_i2c_addr_write = 0x78;
 bool oled_online = false;
 DebugStatus_t g_debug_status = {0};
+
+typedef struct
+{
+  float kp;
+  float ki;
+  float kd;
+  float i_term;
+  int16_t last_error;
+  int16_t duty;
+} WheelPID_t;
+
+static WheelPID_t g_pid_left  = {PID_KP, PID_KI, PID_KD, 0, 0, 0};
+static WheelPID_t g_pid_right = {PID_KP, PID_KI, PID_KD, 0, 0, 0};
 
 /* USER CODE END PV */
 
@@ -97,13 +128,18 @@ static void VOFA_SendFireWaterFrame(const DebugStatus_t *status);
 static void MOTOR_SetChannelPair(uint32_t channel, int16_t duty);
 static void MOTOR_SetPM1(int16_t duty);
 static void MOTOR_SetPM2(int16_t duty);
+static void MOTOR_StopAll(void);
+static void CHASSIS_SetOpenLoop(int16_t left_target, int16_t right_target);
+static void CHASSIS_SetSpeed(int16_t left_spd, int16_t right_spd);
+static const char *MOTOR_GetModeName(uint8_t mode);
 static uint8_t READ_GRAY_L2(void);
 static uint8_t READ_GRAY_L1(void);
 static uint8_t READ_GRAY_M(void);
 static uint8_t READ_GRAY_R1(void);
 static uint8_t READ_GRAY_R2(void);
-static int16_t ENCODER_GetPM1Count(void);
-static int16_t ENCODER_GetPM2Count(void);
+static uint8_t GRAY_GetPattern(void);
+static int8_t GRAY_CalcError(uint8_t pattern, int8_t *last_error);
+static void CHASSIS_ApplyTrace(int8_t error, uint8_t pattern);
 
 /* USER CODE END PFP */
 
@@ -112,6 +148,15 @@ static int16_t ENCODER_GetPM2Count(void);
 #define OLED_I2C_ADDR_3C_WRITE 0x78
 #define OLED_I2C_ADDR_3D_WRITE 0x7A
 #define OLED_COLUMN_OFFSET 2U
+
+enum
+{
+  MOTOR_MODE_STOP = 0,
+  MOTOR_MODE_TRACE,
+  MOTOR_MODE_SEARCH_LEFT,
+  MOTOR_MODE_SEARCH_RIGHT,
+  MOTOR_MODE_LOST_STRAIGHT
+};
 
 static const uint8_t oled_digit_segments[10] = {
   0x3F, /* 0 */
@@ -129,6 +174,18 @@ static const uint8_t oled_digit_segments[10] = {
 static void UART2_SendString(const char *str)
 {
   HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), HAL_MAX_DELAY);
+}
+
+static const char *MOTOR_GetModeName(uint8_t mode)
+{
+  switch (mode)
+  {
+    case MOTOR_MODE_TRACE: return "TRACE";
+    case MOTOR_MODE_SEARCH_LEFT: return "SEARCH_L";
+    case MOTOR_MODE_SEARCH_RIGHT: return "SEARCH_R";
+    case MOTOR_MODE_LOST_STRAIGHT: return "LOST_STRAIGHT";
+    default: return "STOP";
+  }
 }
 
 static void MOTOR_SetChannelPair(uint32_t channel, int16_t duty)
@@ -178,6 +235,78 @@ static void MOTOR_SetPM2(int16_t duty)
   MOTOR_SetChannelPair(TIM_CHANNEL_2, duty);
 }
 
+static void MOTOR_StopAll(void)
+{
+  MOTOR_SetPM1(0);
+  MOTOR_SetPM2(0);
+}
+
+static void CHASSIS_SetOpenLoop(int16_t left_target, int16_t right_target)
+{
+  g_debug_status.left_target = left_target;
+  g_debug_status.right_target = right_target;
+  MOTOR_SetPM1(left_target);
+  MOTOR_SetPM2(right_target);
+}
+
+/* 单轮增量式 PID，target/actual 单位：counts/10ms（带符号）*/
+static int16_t WHEEL_PID_Calc(WheelPID_t *pid, int16_t target, int16_t actual)
+{
+  int16_t error = target - actual;
+  int16_t d_term = error - pid->last_error;
+
+  pid->i_term += pid->ki * (float)error;
+  if (pid->i_term >  (float)PID_ITERM_MAX) pid->i_term =  (float)PID_ITERM_MAX;
+  if (pid->i_term < -(float)PID_ITERM_MAX) pid->i_term = -(float)PID_ITERM_MAX;
+
+  pid->duty += (int16_t)(pid->kp * (float)error
+                       + pid->i_term
+                       + pid->kd * (float)d_term);
+
+  if (pid->duty >  PID_OUT_MAX) pid->duty =  PID_OUT_MAX;
+  if (pid->duty < -PID_OUT_MAX) pid->duty = -PID_OUT_MAX;
+
+  pid->last_error = error;
+  return pid->duty;
+}
+
+/* 以目标转速（counts/10ms）控制底盘，内部调 PID 输出 duty */
+static void CHASSIS_SetSpeed(int16_t left_spd, int16_t right_spd)
+{
+  int16_t left_duty;
+  int16_t right_duty;
+
+  g_debug_status.left_target  = left_spd;
+  g_debug_status.right_target = right_spd;
+
+  /* 目标为 0 时直接停车并复位积分，避免积分饱和 */
+  if (left_spd == 0)
+  {
+    g_pid_left.i_term = 0;
+    g_pid_left.duty   = 0;
+    MOTOR_SetPM1(0);
+  }
+  else
+  {
+    left_duty = WHEEL_PID_Calc(&g_pid_left, left_spd, g_debug_status.left_speed);
+    g_debug_status.left_duty = left_duty;
+    MOTOR_SetPM1(left_duty);
+  }
+
+  if (right_spd == 0)
+  {
+    g_pid_right.i_term = 0;
+    g_pid_right.duty   = 0;
+    MOTOR_SetPM2(0);
+  }
+  else
+  {
+    right_duty = WHEEL_PID_Calc(&g_pid_right, right_spd, g_debug_status.right_speed);
+    g_debug_status.right_duty = right_duty;
+    MOTOR_SetPM2(right_duty);
+  }
+}
+
 static uint8_t READ_GRAY_L2(void)
 {
   return (uint8_t)HAL_GPIO_ReadPin(L2_GPIO_Port, L2_Pin);
@@ -203,14 +332,135 @@ static uint8_t READ_GRAY_R2(void)
   return (uint8_t)HAL_GPIO_ReadPin(R2_GPIO_Port, R2_Pin);
 }
 
-static int16_t ENCODER_GetPM1Count(void)
+static uint8_t GRAY_GetPattern(void)
 {
-  return (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+  uint8_t pattern = 0;
+
+  pattern |= (uint8_t)(READ_GRAY_L2() ? 0x10U : 0x00U);
+  pattern |= (uint8_t)(READ_GRAY_L1() ? 0x08U : 0x00U);
+  pattern |= (uint8_t)(READ_GRAY_M()  ? 0x04U : 0x00U);
+  pattern |= (uint8_t)(READ_GRAY_R1() ? 0x02U : 0x00U);
+  pattern |= (uint8_t)(READ_GRAY_R2() ? 0x01U : 0x00U);
+
+  return pattern;
 }
 
-static int16_t ENCODER_GetPM2Count(void)
+static int8_t GRAY_CalcError(uint8_t pattern, int8_t *last_error)
 {
-  return (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
+  int16_t numerator = 0;
+  int16_t denominator = 0;
+  uint8_t inner_pattern = (uint8_t)(pattern & 0x0EU);
+  uint8_t edge_left  = (uint8_t)(pattern & 0x10U);
+  uint8_t edge_right = (uint8_t)(pattern & 0x01U);
+
+  /* L2/R2 单独压线（内三路全灭）时直接给最大误差，加快大偏差修正 */
+  if ((edge_left != 0U) && (inner_pattern == 0U) && (edge_right == 0U))
+  {
+    *last_error = -4;
+    return *last_error;
+  }
+  if ((edge_right != 0U) && (inner_pattern == 0U) && (edge_left == 0U))
+  {
+    *last_error = 4;
+    return *last_error;
+  }
+
+  /* 正常修正使用 L1 / M / R1 */
+  if ((inner_pattern & 0x08U) != 0U)
+  {
+    numerator += -2;
+    denominator++;
+  }
+  if ((inner_pattern & 0x04U) != 0U)
+  {
+    denominator++;
+  }
+  if ((inner_pattern & 0x02U) != 0U)
+  {
+    numerator += 2;
+    denominator++;
+  }
+
+  if (denominator == 0)
+  {
+    return *last_error;
+  }
+
+  *last_error = (int8_t)(numerator / denominator);
+  return *last_error;
+}
+
+static void CHASSIS_ApplyTrace(int8_t error, uint8_t pattern)
+{
+  int16_t left_spd  = (int16_t)(SPD_BASE + SPD_BIAS);
+  int16_t right_spd = (int16_t)SPD_BASE;
+  int16_t correction = 0;
+  uint8_t inner_pattern = (uint8_t)(pattern & 0x0EU);
+  uint8_t edge_left  = (uint8_t)(pattern & 0x10U);
+  uint8_t edge_right = (uint8_t)(pattern & 0x01U);
+
+  /* 优先处理边缘兜底：L2 / R2 看到线时，不做正常修正 */
+  if ((edge_left != 0U) && (inner_pattern == 0U))
+  {
+    g_debug_status.motor_mode = MOTOR_MODE_SEARCH_LEFT;
+    left_spd  = 0;
+    right_spd = (int16_t)SPD_SEARCH;
+  }
+  else if ((edge_right != 0U) && (inner_pattern == 0U))
+  {
+    g_debug_status.motor_mode = MOTOR_MODE_SEARCH_RIGHT;
+    left_spd  = (int16_t)SPD_SEARCH;
+    right_spd = 0;
+  }
+  else if (inner_pattern == 0U)
+  {
+    g_debug_status.motor_mode = MOTOR_MODE_LOST_STRAIGHT;
+    left_spd  = (int16_t)SPD_SEARCH;
+    right_spd = (int16_t)SPD_SEARCH;
+  }
+  else
+  {
+    g_debug_status.motor_mode = MOTOR_MODE_TRACE;
+
+    /* 仅中间探头压线时，保持直行，不做修正 */
+    if (inner_pattern == 0x04U)
+    {
+      correction = 0;
+    }
+    else if (error <= -3)
+    {
+      correction = 20;
+    }
+    else if (error == -2)
+    {
+      correction = 12;
+    }
+    else if (error == -1)
+    {
+      correction = 5;
+    }
+    else if (error >= 3)
+    {
+      correction = -20;
+    }
+    else if (error == 2)
+    {
+      correction = -12;
+    }
+    else if (error == 1)
+    {
+      correction = -5;
+    }
+    else
+    {
+      correction = 0;
+    }
+
+    left_spd  -= correction;
+    right_spd += correction;
+  }
+
+  CHASSIS_SetSpeed(left_spd, right_spd);
 }
 
 static void OLED_I2C_Delay(void)
@@ -439,12 +689,12 @@ static void OLED_DrawStatus(const DebugStatus_t *status)
   uint8_t d3;
   uint8_t d4;
   uint8_t progress_width;
-  uint16_t shown1;
-  uint16_t shown2;
-  uint8_t e0;
-  uint8_t e1;
-  uint8_t e2;
-  uint8_t e3;
+  uint16_t shown_left;
+  uint16_t shown_right;
+  uint8_t t0;
+  uint8_t t1;
+  uint8_t t2;
+  uint8_t t3;
 
   if (!oled_online)
   {
@@ -474,25 +724,27 @@ static void OLED_DrawStatus(const DebugStatus_t *status)
   }
   else
   {
-    shown1 = (uint16_t)((status->enc1 >= 0) ? status->enc1 : -status->enc1);
-    shown2 = (uint16_t)((status->enc2 >= 0) ? status->enc2 : -status->enc2);
-    shown1 %= 100U;
-    shown2 %= 100U;
-    e0 = (uint8_t)((shown1 / 10U) % 10U);
-    e1 = (uint8_t)(shown1 % 10U);
-    e2 = (uint8_t)((shown2 / 10U) % 10U);
-    e3 = (uint8_t)(shown2 % 10U);
+    shown_left = (uint16_t)((status->left_target >= 0) ? status->left_target : -status->left_target);
+    shown_right = (uint16_t)((status->right_target >= 0) ? status->right_target : -status->right_target);
+    shown_left /= 10U;
+    shown_right /= 10U;
+    shown_left %= 100U;
+    shown_right %= 100U;
+    t0 = (uint8_t)((shown_left / 10U) % 10U);
+    t1 = (uint8_t)(shown_left % 10U);
+    t2 = (uint8_t)((shown_right / 10U) % 10U);
+    t3 = (uint8_t)(shown_right % 10U);
 
-    OLED_DrawDigit7Seg(12, 14, e0);
-    OLED_DrawDigit7Seg(40, 14, e1);
-    OLED_DrawDigit7Seg(68, 14, e2);
-    OLED_DrawDigit7Seg(96, 14, e3);
+    OLED_DrawDigit7Seg(12, 14, t0);
+    OLED_DrawDigit7Seg(40, 14, t1);
+    OLED_DrawDigit7Seg(68, 14, t2);
+    OLED_DrawDigit7Seg(96, 14, t3);
 
-    if (status->enc1 < 0)
+    if (status->left_target < 0)
     {
       OLED_FillRect(0, 30, 8, 2, true);
     }
-    if (status->enc2 < 0)
+    if (status->right_target < 0)
     {
       OLED_FillRect(56, 30, 8, 2, true);
     }
@@ -520,7 +772,7 @@ static void OLED_DrawStatus(const DebugStatus_t *status)
     OLED_FillRect(126, 2, 2, 3, true);
   }
 
-  if (status->motor_enable != 0U)
+  if (status->motor_mode != 0U)
   {
     OLED_FillRect(110, 2, 4, 4, true);
   }
@@ -533,16 +785,16 @@ static void DEBUG_SendBootFrame(void)
   snprintf(
       uart_msg,
       sizeof(uart_msg),
-      "BOOT|mode=%s|motor=%u|l2=%u|l1=%u|m=%u|r1=%u|r2=%u|enc1=%d|enc2=%d|uart=%u|oled=%u|addr=0x%02X|err=%u\r\n",
+      "BOOT|mode=%s|step=%s|left=%d|right=%d|l2=%u|l1=%u|m=%u|r1=%u|r2=%u|uart=%u|oled=%u|addr=0x%02X|err=%u\r\n",
       DEBUG_MODE_NAME,
-      g_debug_status.motor_enable,
+      MOTOR_GetModeName(g_debug_status.motor_mode),
+      g_debug_status.left_target,
+      g_debug_status.right_target,
       g_debug_status.gray_l2,
       g_debug_status.gray_l1,
       g_debug_status.gray_m,
       g_debug_status.gray_r1,
       g_debug_status.gray_r2,
-      g_debug_status.enc1,
-      g_debug_status.enc2,
       g_debug_status.uart_online,
       g_debug_status.oled_online_flag,
       (unsigned int)(oled_i2c_addr_write >> 1),
@@ -555,17 +807,17 @@ static void DEBUG_SendStatusFrame(const DebugStatus_t *status)
   snprintf(
       uart_msg,
       sizeof(uart_msg),
-      "COMBO|mode=%s|hb=%lu|motor=%u|l2=%u|l1=%u|m=%u|r1=%u|r2=%u|enc1=%d|enc2=%d|uart=%u|oled=%u|err=%u\r\n",
+      "OPEN|mode=%s|hb=%lu|step=%s|left=%d|right=%d|l2=%u|l1=%u|m=%u|r1=%u|r2=%u|uart=%u|oled=%u|err=%u\r\n",
       DEBUG_MODE_NAME,
       status->heartbeat,
-      status->motor_enable,
+      MOTOR_GetModeName(status->motor_mode),
+      status->left_target,
+      status->right_target,
       status->gray_l2,
       status->gray_l1,
       status->gray_m,
       status->gray_r1,
       status->gray_r2,
-      status->enc1,
-      status->enc2,
       status->uart_online,
       status->oled_online_flag,
       status->error_flag);
@@ -577,15 +829,14 @@ static void VOFA_SendFireWaterFrame(const DebugStatus_t *status)
   snprintf(
       uart_msg,
       sizeof(uart_msg),
-      "obs:%u,%u,%u,%u,%u,%d,%d\n",
-      status->motor_enable,
+      "obs:%d,%d,%u,%u,%u,%u,%u\n",
+      status->left_target,
+      status->right_target,
       status->gray_l2,
       status->gray_l1,
       status->gray_m,
       status->gray_r1,
-      status->gray_r2,
-      status->enc1,
-      status->enc2);
+      status->gray_r2);
   UART2_SendString(uart_msg);
 }
 
@@ -673,17 +924,21 @@ int main(void)
   MX_TIM4_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+  HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+  __HAL_TIM_SET_COUNTER(&htim3, 0);
+  __HAL_TIM_SET_COUNTER(&htim4, 0);
   g_debug_status.heartbeat = 0;
   g_debug_status.error_flag = 0;
   g_debug_status.uart_online = 1;
+  g_debug_status.motor_mode = 0;
   g_debug_status.gray_l2 = 0;
   g_debug_status.gray_l1 = 0;
   g_debug_status.gray_m = 0;
   g_debug_status.gray_r1 = 0;
   g_debug_status.gray_r2 = 0;
-  g_debug_status.enc1 = 0;
-  g_debug_status.enc2 = 0;
-  g_debug_status.motor_enable = 0;
+  g_debug_status.left_target = 0;
+  g_debug_status.right_target = 0;
 
   UART2_SendString("System boot OK\r\n");
   UART2_SendString("USART2 ready, baud=115200\r\n");
@@ -705,12 +960,7 @@ int main(void)
   g_debug_status.gray_m = READ_GRAY_M();
   g_debug_status.gray_r1 = READ_GRAY_R1();
   g_debug_status.gray_r2 = READ_GRAY_R2();
-  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
-  __HAL_TIM_SET_COUNTER(&htim3, 0);
-  HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
-  __HAL_TIM_SET_COUNTER(&htim4, 0);
-  MOTOR_SetPM1(0);
-  MOTOR_SetPM2(0);
+  MOTOR_StopAll();
   OLED_DrawStatus(&g_debug_status);
   DEBUG_SendBootFrame();
   VOFA_SendFireWaterFrame(&g_debug_status);
@@ -721,34 +971,42 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    static int8_t last_error = 0;
+    static int32_t last_enc_left  = 0;
+    static int32_t last_enc_right = 0;
+    int32_t cur_enc_left;
+    int32_t cur_enc_right;
+    uint8_t gray_pattern;
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* 读取编码器，计算当前转速（counts/10ms，带符号）*/
+    cur_enc_left  = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+    cur_enc_right = (int16_t)__HAL_TIM_GET_COUNTER(&htim4);
+    g_debug_status.left_speed  = (int16_t)(cur_enc_left  - last_enc_left);
+    g_debug_status.right_speed = (int16_t)(cur_enc_right - last_enc_right);
+    last_enc_left  = cur_enc_left;
+    last_enc_right = cur_enc_right;
+
     g_debug_status.heartbeat = uart_heartbeat++;
-    if ((g_debug_status.heartbeat % (2U * MOTOR_RUN_WINDOW_TICKS)) < MOTOR_RUN_WINDOW_TICKS)
-    {
-      g_debug_status.motor_enable = 1U;
-      MOTOR_SetPM1((int16_t)MOTOR_TEST_DUTY);
-      MOTOR_SetPM2((int16_t)MOTOR_TEST_DUTY);
-    }
-    else
-    {
-      g_debug_status.motor_enable = 0U;
-      MOTOR_SetPM1(0);
-      MOTOR_SetPM2(0);
-    }
     g_debug_status.gray_l2 = READ_GRAY_L2();
     g_debug_status.gray_l1 = READ_GRAY_L1();
     g_debug_status.gray_m = READ_GRAY_M();
     g_debug_status.gray_r1 = READ_GRAY_R1();
     g_debug_status.gray_r2 = READ_GRAY_R2();
-    g_debug_status.enc1 = ENCODER_GetPM1Count();
-    g_debug_status.enc2 = ENCODER_GetPM2Count();
+    gray_pattern = GRAY_GetPattern();
+    CHASSIS_ApplyTrace(
+        GRAY_CalcError(gray_pattern, &last_error),
+        gray_pattern);
 
     DEBUG_SendStatusFrame(&g_debug_status);
     VOFA_SendFireWaterFrame(&g_debug_status);
-    OLED_DrawStatus(&g_debug_status);
-    HAL_Delay(200);
+    if (uart_heartbeat % 5U == 0U)
+    {
+      OLED_DrawStatus(&g_debug_status);
+    }
+    HAL_Delay(10);
   }
   /* USER CODE END 3 */
 }
